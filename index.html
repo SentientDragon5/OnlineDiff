@@ -62,7 +62,6 @@ textarea::placeholder{color:var(--muted);opacity:.7}
 <body>
 <main>
   <h1>OnlineDiff</h1>
-  
 
   <div class="grid">
     <div class="card">
@@ -78,7 +77,8 @@ textarea::placeholder{color:var(--muted);opacity:.7}
   <div class="bar">
     <label>Highlight by
       <select id="mode">
-        <option value="word" selected>Word</option>
+        <option value="sentence" selected>Sentence</option>
+        <option value="word">Word</option>
         <option value="char">Character</option>
         <option value="line">Line</option>
       </select>
@@ -154,6 +154,128 @@ function diff(a, b){
 
 // Smarter character diff: align whole words first, then only look inside words that were actually
 // swapped for similar ones. Tiny coincidental matches (a stray "e" or "ers") are folded back into the change.
+function smartSentence(a, b){
+  const raw = diff(tokenize(a, 'word'), tokenize(b, 'word'));
+
+  const out = [];
+  let i = 0;
+  while (i < raw.length) {
+    if (raw[i][0] === 0) {
+      out.push(raw[i]);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < raw.length) {
+      if (raw[j][0] !== 0) { j++; continue; }
+      const sameTxt = raw[j][1];
+      if (/\n/.test(sameTxt) || /\.(?:\s|$)/.test(sameTxt)) break;
+      let k = j + 1;
+      while (k < raw.length && raw[k][0] === 0) {
+        if (/\n/.test(raw[k][1]) || /\.(?:\s|$)/.test(raw[k][1])) break;
+        k++;
+      }
+      if (k >= raw.length || raw[k][0] === 0) break;
+      const bridgeTxt = raw.slice(j, k).map(r => r[1]).join('');
+      const bridgeWords = words(bridgeTxt);
+      if (bridgeWords < 2) {
+        j = k;
+        continue;
+      }
+      break;
+    }
+
+    let del = '', ins = '';
+    for (let p = i; p < j; p++) {
+      if (raw[p][0] === -1) del += raw[p][1];
+      else if (raw[p][0] === 1) ins += raw[p][1];
+      else { del += raw[p][1]; ins += raw[p][1]; }
+    }
+
+    const trimSpan = s => {
+      const m = s.match(/^([ \t]*)(.*?)([ \t]*)$/s);
+      return [m[1], m[2], m[3]];
+    };
+    const [dl, , dr] = trimSpan(del);
+    const [il, , ir] = trimSpan(ins);
+    const pre = dl.length <= il.length ? dl : il;
+    const post = dr.length <= ir.length ? dr : ir;
+    const dCore = del.slice(pre.length, del.length - post.length);
+    const iCore = ins.slice(pre.length, ins.length - post.length);
+    if (pre) out.push([0, pre]);
+    if (dCore) out.push([-1, dCore]);
+    if (iCore) out.push([1, iCore]);
+    if (post) out.push([0, post]);
+    i = j;
+  }
+
+  const splitSentenceBounds = (t, x) => {
+    if (t === 0) return [[0, x]];
+    const pieces = x.split(/(\n+|\.(?=\s|$))/);
+    const res = [];
+    for (const p of pieces) {
+      if (!p) continue;
+      if (/^\n+$/.test(p)) res.push([0, p]);
+      else res.push([t, p]);
+    }
+    return res;
+  };
+
+  const refined = [];
+  for (const [t, x] of out) {
+    refined.push(...splitSentenceBounds(t, x));
+  }
+
+  const finalOps = [];
+  let idx = 0;
+  while (idx < refined.length) {
+    if (refined[idx][0] === 0) {
+      finalOps.push(refined[idx]);
+      idx++;
+      continue;
+    }
+    let end = idx;
+    while (end < refined.length && refined[end][0] !== 0) end++;
+    let dAll = '', iAll = '';
+    for (let p = idx; p < end; p++) {
+      if (refined[p][0] === -1) dAll += refined[p][1];
+      else iAll += refined[p][1];
+    }
+    const splitSentences = s => s.split(/(?<=\.)(?=\s|$)/).filter(Boolean);
+    const dSents = splitSentences(dAll);
+    const iSents = splitSentences(iAll);
+    if (dSents.length > 1 || iSents.length > 1) {
+      const len = Math.max(dSents.length, iSents.length);
+      for (let s = 0; s < len; s++) {
+        let ds = dSents[s] || '', is = iSents[s] || '';
+        const dm = ds.match(/^([ \t]*)(.*?)([ \t]*)$/s);
+        const im = is.match(/^([ \t]*)(.*?)([ \t]*)$/s);
+        const lsp = dm[1].length <= im[1].length ? dm[1] : im[1];
+        const rsp = dm[3].length <= im[3].length ? dm[3] : im[3];
+        if (lsp) finalOps.push([0, lsp]);
+        const dc = ds.slice(lsp.length, ds.length - rsp.length);
+        const ic = is.slice(lsp.length, is.length - rsp.length);
+        if (dc) finalOps.push([-1, dc]);
+        if (ic) finalOps.push([1, ic]);
+        if (rsp) finalOps.push([0, rsp]);
+      }
+    } else {
+      if (dAll) finalOps.push([-1, dAll]);
+      if (iAll) finalOps.push([1, iAll]);
+    }
+    idx = end;
+  }
+
+  const merged = [];
+  for (const [t, x] of finalOps) {
+    if (!x) continue;
+    const last = merged[merged.length - 1];
+    if (last && last[0] === t && !/\.(?:\s|$)/.test(last[1])) last[1] += x;
+    else merged.push([t, x]);
+  }
+  return merged;
+}
+
 function refine(da, ib){
   const ops = diff(Array.from(da), Array.from(ib));
   const shorter = Math.min(da.length, ib.length);
@@ -194,12 +316,15 @@ function render(from){
   OUT.textContent = '';
   OUT.contentEditable = (a || b) ? 'true' : 'false';
   if (!a && !b) {
-    
     $('sa').textContent = '+0'; $('sd').textContent = '−0'; $('cr').textContent = ''; stAdd = stDel = 0; setFavicon(0); updateTitle();
     return;
   }
   const mode = MODE.value;
-  const ops = mode === 'char' ? smartChar(a, b) : diff(tokenize(a, mode), tokenize(b, mode));
+  const ops = mode === 'char'
+    ? smartChar(a, b)
+    : mode === 'sentence'
+      ? smartSentence(a, b)
+      : diff(tokenize(a, mode), tokenize(b, mode));
   const frag = document.createDocumentFragment();
   let grp = null;
   for (const [t, x] of ops) {
